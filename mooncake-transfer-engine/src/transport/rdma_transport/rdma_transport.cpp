@@ -145,8 +145,9 @@ bool has_ibv_reg_mr_iova2(void) {
 }
 
 RdmaTransport::RdmaTransport() {
+    // 探测"PCIe relaxed ordering"能不能用: 允许数据包不严格按顺序到达,能提升带宽
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
-    if (MCIbRelaxedOrderingMode == 0) {
+    if (MCIbRelaxedOrderingMode == 0) { // 被手动关闭
         LOG(INFO) << "[RDMA] Relaxed ordering disabled via "
                   << "MC_IB_PCI_RELAXED_ORDERING=0. "
                   << "Falling back to strict ordering.";
@@ -154,7 +155,7 @@ RdmaTransport::RdmaTransport() {
         return;
     }
 
-    MCIbRelaxedOrderingEnabled = has_ibv_reg_mr_iova2();
+    MCIbRelaxedOrderingEnabled = has_ibv_reg_mr_iova2(); // 探测驱动是否支持
     if (MCIbRelaxedOrderingEnabled) {
         LOG(INFO) << "[RDMA] Relaxed ordering is supported on this host; "
                      "IBV_ACCESS_RELAXED_ORDERING will be requested for "
@@ -171,9 +172,9 @@ RdmaTransport::~RdmaTransport() {
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
 #endif
-    metadata_->removeSegmentDesc(local_server_name_);
+    metadata_->removeSegmentDesc(local_server_name_); // // 从元数据撤下自己
     batch_desc_set_.clear();
-    context_list_.clear();
+    context_list_.clear(); // 释放所有网卡 context
 }
 
 int RdmaTransport::install(std::string &local_server_name,
@@ -187,7 +188,7 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
-
+    // 处理双网卡场景(`MC_RDMA_BIND_ADDRESS` 允许 RDMA 走独立 IP,与 TCP 用的`local_server_name_` 分开)
     // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
     // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
     // while local_server_name_ keeps the TCP-reachable address for P2P.
@@ -202,26 +203,29 @@ int RdmaTransport::install(std::string &local_server_name,
     } else {
         rdma_server_name_ = local_server_name_;
     }
-
+    // 建立 RDMA 硬件资源:遍历拓扑里发现的每张 HCA,为每张网卡创建一个`RdmaContext` (打开设备、建 PD/CQ 等)
     auto ret = initializeRdmaResources();
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot initialize RDMA resources";
         return ret;
     }
-
+    // 构建本节点的 local segment 描述, 这是别的节点要连你、往你这写数据时需要的信息
+    // "我这个节点有哪些网卡、每张网卡叫什么、能被怎么访问"
     ret = allocateLocalSegmentID();
     if (ret) {
         LOG(ERROR) << "Transfer engine cannot be initialized: cannot "
                       "allocate local segment";
         return ret;
     }
-
+    // 启动一个后台守护,监听别的节点发来的 握手请求
+    // RDMA 连接(QP)是点对点的,双方要交换 QP 号、LID/GID 等参数才能建连
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot start handshake daemon";
         return ret;
     }
-
+    // 把第 2 步构建的 segment 描述 发布到元数据服务 (etcd/http)
+    // 集群里其他节点就能通过元数据查到"这个节点有这些网卡资源",从而发起连接
     ret = metadata_->updateLocalSegmentDesc();
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot publish segments";
@@ -790,7 +794,7 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
 }
-
+// 把一批 TransferRequest 装入 BatchDesc
 Status RdmaTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
@@ -818,16 +822,16 @@ Status RdmaTransport::submitTransfer(
     }
     return submitTransferTask(task_list);
 }
-
+// 把所有请求填满 slices_to_post 这张"按网卡分组的发送清单",最后统一 post
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
+        slices_to_post; // 按照网卡(RdmaContext)对切片分组
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
-        target_segment_descs;
+        target_segment_descs; // 目标段描述缓存
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
-    const size_t kBlockSize = globalConfig().slice_size;
+    const size_t kBlockSize = globalConfig().slice_size; // 每片多大(切片粒度)
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
@@ -866,6 +870,9 @@ Status RdmaTransport::submitTransferTask(
     };
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
+    /*
+    * 遍历每个request: 查询目标 SegmentDesc + 选择用哪张网卡发送
+    */
     while (task_index < task_list.size()) {
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
@@ -882,12 +889,13 @@ Status RdmaTransport::submitTransferTask(
             target_desc_it =
                 target_segment_descs
                     .emplace(request.target_id,
-                             metadata_->getSegmentDescByID(request.target_id))
+                             metadata_->getSegmentDescByID(request.target_id)) // 弄清"目标那块内存在哪台机器、哪张网卡、rkey 是多少"
                     .first;
         }
         const auto &target_segment_desc = target_desc_it->second;
 
         auto request_buffer_id = -1, request_device_id = -1;
+        // 根据本地源地址落在哪块注册内存上,决定用哪张本地 HCA 发。返回`buffer_id` (哪块注册内存)和`device_id` (哪张网卡)
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
                          request.length, request_buffer_id,
                          request_device_id)) {
@@ -898,10 +906,11 @@ Status RdmaTransport::submitTransferTask(
         SliceLengthCalculator slice_calc{request, kBlockSize, kFragmentSize,
                                          local_segment_desc.get(),
                                          target_segment_desc.get()};
+        // 一个长度为 L 的请求,按`kBlockSize` 切成`ceil(L/kBlockSize)` 个 slice
         for (uint64_t offset = 0; offset < request.length;) {
             size_t slice_length = slice_calc.calculate(offset);
 
-            Slice *slice = getSliceCache().allocate();
+            Slice *slice = getSliceCache().allocate(); // 从线程本地缓存拿一个 Slice
             assert(slice);
             if (!slice->from_cache) {
                 nr_slices++;
@@ -918,19 +927,20 @@ Status RdmaTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             slice->ts = 0;
-            task.slice_list.push_back(slice);
+            task.slice_list.push_back(slice); // 挂到 task 的 slice 列表
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
-                if (request_context && request_context->active()) {
+                if (request_context && request_context->active()) { // !request_context->active(): 首选网卡不活跃(比如坏了)
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
                 }
             }
+            // 先试用 request 级别选好的设备;不行就带重试地重新 selectDevice
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
@@ -940,7 +950,7 @@ Status RdmaTransport::submitTransferTask(
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
-                if (!context->active()) continue;
+                if (!context->active()) continue; // 网卡没激活就换下一个(重试机制)
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -950,6 +960,7 @@ Status RdmaTransport::submitTransferTask(
                 break;
             }
             if (!found_device) {
+                // 这块内存没在任何活跃网卡上注册过 → 直接失败
                 auto source_addr = slice->source_addr;
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
@@ -974,14 +985,14 @@ Status RdmaTransport::submitTransferTask(
                         local_segment_desc->buffers[buffer_id],
                         reinterpret_cast<uint64_t>(slice->source_addr));
                 }
-                slices_to_post[context].push_back(slice);
+                slices_to_post[context].push_back(slice); // 按网卡(context)分组塞入发送清单
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
-
+            // 攒够一批(水位线)就先发一波,避免内存里堆太多
             if (nr_slices >= kSubmitWatermark) {
                 for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
+                    entry.first->submitPostSend(entry.second); // context->submitPostSend(该网卡的slices)
                 slices_to_post.clear();
                 nr_slices = 0;
             }
@@ -989,7 +1000,7 @@ Status RdmaTransport::submitTransferTask(
             offset += slice->length;
         }
     }
-
+    // 把剩下没到水位线的也统一发出去
     for (auto &entry : slices_to_post)
         if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
     return Status::OK();
@@ -1007,7 +1018,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
             __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
         uint64_t failed_slice_count =
             __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
-        if (success_slice_count + failed_slice_count == task.slice_count) {
+        if (success_slice_count + failed_slice_count == task.slice_count) { // 所有 slice 都有结果了
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
             else

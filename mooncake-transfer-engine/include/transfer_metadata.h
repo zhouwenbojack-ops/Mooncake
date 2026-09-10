@@ -69,7 +69,7 @@ class TransferMetadata {
 #else
         using mr_key_t = uint32_t;
 #endif
-        std::vector<mr_key_t> lkey;         // for rdma/efa
+        std::vector<mr_key_t> lkey;         // for rdma/efa, 本地内存注册给这张网卡后拿到的钥匙, RDMA 传数据前内存必须先注册(pin + 拿 lkey/rkey)
         std::vector<mr_key_t> rkey;         // for rdma/efa
         std::string shm_name;               // for nvlink and hip
         uint64_t offset;                    // for cxl

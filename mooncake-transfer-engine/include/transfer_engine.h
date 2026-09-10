@@ -66,7 +66,7 @@ struct AutoDiscoverConfig {
     bool enabled = false;
     std::string protocol;
 };
-
+// facade, 将调用转发到 impl
 class TransferEngine {
    public:
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -90,7 +90,7 @@ class TransferEngine {
 #endif
 
     TransferEngine(bool auto_discover = false);
-
+    // auto_discover 和 filter 用于自动发现网卡拓扑
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
     TransferEngine(TransferEngine&& other) noexcept;
@@ -98,7 +98,9 @@ class TransferEngine {
     TransferEngine& operator=(TransferEngine&& other) noexcept;
 
     ~TransferEngine();
-
+    // 两阶段初始化: 构造函数不会真正启动engine, init才是真正初始化.
+    // metadata_conn_string: 元数据后端(etcd, http等)的连接串;
+    // local_server_name: 本节点在集群中的标识.
     int init(const std::string& metadata_conn_string,
              const std::string& local_server_name,
              const std::string& ip_or_host_name = "",
@@ -280,6 +282,7 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    // pimpl 模式, impl_ 经典实现, impl_tent_ 新实现, 通过use_tent_切换
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;

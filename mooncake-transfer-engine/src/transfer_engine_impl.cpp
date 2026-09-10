@@ -79,6 +79,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
+    // 确定本机 IP + 端口(默认自动选端口),填`RpcMetaDesc`
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -189,7 +190,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                       : "")
 #endif
               << "";
-
+    // 建`metadata_` (元数据客户端)、`multi_transports_` (传输管理器),`addRpcMetaEntry` 注册身份
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
     std::string mutable_server_name =
@@ -207,6 +208,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     // transport installation logic and use TCP transport only. This allows
     // running metadata-only instances without requiring specialized hardware
     // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
+    // 按 强制TCP>平台>GPU P2P>RDMA>TCP 的优先级`installTransport`
     if (getenv("MC_FORCE_TCP")) {
 #ifdef USE_TCP
         Transport* tcp_transport =
@@ -408,6 +410,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
+            // 发现了 RDMA 网卡(HCA)就装 RDMA,没有就退回 TCP
             const std::string transport_type = autoDiscoverTransport();
             Transport* transport = nullptr;
             if (transport_type == "barex") {
@@ -430,6 +433,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(INFO) << "installTransport, type=" << transport_type;
             }
         } else {
+            // 没发现网卡 → 退回 TCP
             Transport* tcp_transport =
                 multi_transports_->installTransport("tcp", nullptr);
             if (!tcp_transport) {
@@ -462,6 +466,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 int TransferEngineImpl::freeEngine() {
     if (metadata_) {
+        // init 时`addRpcMetaEntry` 把自己登记进集群,free 时`removeRpcMetaEntry` 把自己注销掉
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();
     }

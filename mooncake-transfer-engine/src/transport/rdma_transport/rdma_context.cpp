@@ -1467,7 +1467,7 @@ int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
     }
     return nr_poll;
 }
-
+// 把 slice 真正下发给对应网卡(转成 RDMA work request 塞进 QP 发送队列), 此后就是网卡在异步搬数据了
 int RdmaContext::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
     return worker_pool_->submitPostSend(slice_list);

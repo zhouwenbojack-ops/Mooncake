@@ -21,7 +21,7 @@
 
 namespace mooncake {
 class TransferEngineImplTestPeer;
-
+// 一个"协议名 → Transport 后端"的注册表 + 路由器
 class MultiTransport {
     friend class TransferEngineImplTestPeer;
 
@@ -98,9 +98,9 @@ class MultiTransport {
 #endif
 
    private:
-    std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::map<std::string, std::shared_ptr<Transport>> transport_map_;
+    std::shared_ptr<TransferMetadata> metadata_; // 元数据(哪个节点在哪、用什么协议)
+    std::string local_server_name_; // 本节点名
+    std::map<std::string, std::shared_ptr<Transport>> transport_map_; // 协议名 -> Transport 实例
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 };

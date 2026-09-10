@@ -28,12 +28,12 @@
 
 namespace mooncake {
 namespace {
-
+// 把引擎注册进一个全局优雅退出机制: 当进程收到退出信号时, 回调 engine->freeEngine() 把引擎干净地清理掉
 class TransferEngineShutdownToken : public ShutdownToken {
    public:
     explicit TransferEngineShutdownToken(TransferEngine* engine)
         : engine_(engine) {}
-
+    // 被信号处理触发, freeEngine
     void shutdown() override {
         TransferEngine* engine = nullptr;
         {
@@ -43,7 +43,7 @@ class TransferEngineShutdownToken : public ShutdownToken {
         }
         if (engine) engine->freeEngine();
     }
-
+    // 引擎已经正常析构/移动, 避免double free
     void detach() override {
         std::lock_guard<std::mutex> lock(mutex_);
         engine_ = nullptr;
@@ -116,6 +116,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 int TransferEngine::freeEngine() {
     detachShutdownToken(shutdown_token_);
     if (impl_) {
+        // impl_ 可能被多个 TransferEngine共享
         if (impl_.use_count() == 1) impl_->freeEngine();
         impl_.reset();
     }

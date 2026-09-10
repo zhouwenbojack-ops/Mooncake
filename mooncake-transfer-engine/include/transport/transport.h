@@ -49,24 +49,25 @@ class Transport {
    public:
     using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
-
+    // `BatchID` 是个`uint64_t`, 但它其实 直接存的是`BatchDesc*` 指针的整数值
+    // 热路径上避免 map 查找的开销,用指针当句柄. 代价是调用者必须保证对象存活
     using BatchID = uint64_t;
 
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
     using NotifyDesc = TransferMetadata::NotifyDesc;
-
+    // 用户的一次传输请求 (单边语义)
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
         static constexpr uint64_t kNoTaskGroup = 0;
 
-        OpCode opcode;
-        void *source;
-        SegmentID target_id;
-        uint64_t target_offset;
-        size_t length;
+        OpCode opcode; // 读 or 写
+        void *source; // 本地内存地址
+        SegmentID target_id; // 目标 segment(远端节点的一块注册内存)
+        uint64_t target_offset; // 目标 segment 内的偏移
+        size_t length; // 长度
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
@@ -115,7 +116,7 @@ class Transport {
 
     // Slice must be allocated on heap, as it will delete self on markSuccess
     // or markFailed.
-    struct Slice {
+    struct Slice { // 物理传输的最小单位
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
         void *source_addr;
@@ -141,7 +142,7 @@ class Transport {
         // delete the slice.
         using CleanupCallback = void (*)(Slice *);
         CleanupCallback cleanup_callback = nullptr;
-
+        // 不同后端的私有数据
         union {
             struct {
                 uint64_t dest_addr;
@@ -203,6 +204,7 @@ class Transport {
         };
 
        public:
+       // 当网卡回报某个 slice 完成时,slice 用 原子操作 把自己的成果累加回父 task 的计数器
         void markSuccess() {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
@@ -333,12 +335,12 @@ class Transport {
         std::vector<Slice *> lazy_delete_slices_;
         uint64_t head_, tail_;
     };
-
+    // 一个 TransferTask 对应的执行任务
     struct TransferTask {
-        volatile uint64_t slice_count = 0;
-        volatile uint64_t success_slice_count = 0;
-        volatile uint64_t failed_slice_count = 0;
-        volatile uint64_t transferred_bytes = 0;
+        volatile uint64_t slice_count = 0; // 被拆成了几个 slice
+        volatile uint64_t success_slice_count = 0; // 成功了多少个
+        volatile uint64_t failed_slice_count = 0; // 失败了多少个
+        volatile uint64_t transferred_bytes = 0; // 传了多少字节
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
@@ -347,7 +349,7 @@ class Transport {
         // MultiTransport::submitTransfer(). Used to delegate
         // transport-specific completion polling (e.g., CUDA stream
         // query for NVLink async transfers) in getTransferStatus().
-        Transport *transport_ = nullptr;
+        Transport *transport_ = nullptr; // 谁负责本task
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
@@ -365,21 +367,21 @@ class Transport {
         // address to a CPU address.
         TransferRequest *request = nullptr;
 #else
-        const TransferRequest *request = nullptr;
+        const TransferRequest *request = nullptr; // 指回原始请求
 #endif
         size_t request_count = 1;
         // record the slice list for freeing objects
-        std::vector<Slice *> slice_list;
+        std::vector<Slice *> slice_list; // Task的所有物理切片, 一个 task 会被拆成多个`Slice` 。task 完成 = 所有 slice 完成
         ~TransferTask() {
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
     };
-
+    // 一次`submitTransfer` 提交的一批请求打包成一个 batch
     struct BatchDesc {
         BatchID id;
         size_t batch_size;
-        std::vector<TransferTask> task_list;
+        std::vector<TransferTask> task_list; // 这批里的所有 task
         void *context;  // for transport implementers.
         int64_t start_timestamp;
 
@@ -462,6 +464,7 @@ class Transport {
     static ThreadLocalSliceCache &getSliceCache();
 
    private:
+    // RDMA 必须把内存注册给网卡(pin + 拿 lkey/rkey)才能传
     virtual int registerLocalMemory(void *addr, size_t length,
                                     const std::string &location,
                                     bool remote_accessible,

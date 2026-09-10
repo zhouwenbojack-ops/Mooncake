@@ -409,6 +409,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+    // 冲突检查: NCCL必须独占, 装了nccl就不能装别的; rdma和rdma_twosided 不能共存
 #ifdef USE_NCCL_HOST
     if ((proto == "nccl" && !transport_map_.empty()) ||
         (proto != "nccl" && transport_map_.count("nccl") != 0)) {
@@ -417,6 +418,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         return nullptr;
     }
 #endif
+    // 按协议名 new 出对应的 Transport
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
         if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
@@ -569,11 +571,12 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         }
     }
 #endif
+    // 调用后端自己的`install()` 真正初始化: 打开网卡、建 QP、注册拓扑等
     if (transport->install(local_server_name_, metadata_, topo)) {
         delete transport;
         return nullptr;
     }
-
+    // 登记进注册表
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
     return transport;
 }
