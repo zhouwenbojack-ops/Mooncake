@@ -137,3 +137,36 @@ submitTransfer(装batch)
          → 每片完成回调 Slice::markSuccess/markFailed(原子累加到task)
             → getTransferStatus 轮询 success+failed==slice_count 判定完成
 ```
+
+# RealClient
+## 核心API
+- `Put()` —— 写入一个对象(带副本配置`ReplicateConfig` )
+- `Get()` —— 按 key 读出数据到`slices`
+- `Query()` —— 只查元数据(副本在哪),不搬数据
+- `Remove()` —— 删除对象及其所有副本
+
+## TransferSubmitter
+- 一次传输,到底走哪条路?
+    - `Client::Get/Put` 拿到"数据在哪"(一个`Replica::Descriptor` )之后,并不是无脑丢给 TransferEngine. 因为副本可能在 不同介质 上,最优搬运方式完全不同:
+        - 数据就在 本进程内存 → 直接`memcpy` 最快,根本不用走网络
+        - 数据在 远端节点内存 → 走 TransferEngine 做 RDMA/TCP
+        - 数据在 本地磁盘文件 → 走文件读
+        - 数据在 NVMe-oF → 走 SPDK
+        ```cpp
+        enum class TransferStrategy {
+            LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
+            TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
+            FILE_READ = 2,        // File read operation
+            EMPTY = 3,
+            SPDK_NVMF = 4  // Spdk nvmf operation
+        };
+        ```
+    - `TransferSubmitter` 的职责就是:分析这次传输,选出最优策略,然后提交,并返回一个`TransferFuture` 让调用方异步等待结果
+
+## MountSegment
+- 为什么需要 mount?
+    - Store 是分布式的,一个 client 想让 别的节点能通过 RDMA 读写自己的内存 ,必须做两件事:
+        - 让本地的 TransferEngine 知道这块内存(注册成 RDMA 可访问的 memory region,即 MR)
+        - 让 Master 知道这块内存(登记到全局,这样 Master 分配对象时才能把它算作可用空间)
+    - `MountSegment` 就是 同时完成这两件注册 的地方. Master 管"数据该放哪",TransferEngine 管"数据怎么搬"——mount 一块内存,必须两边都登记.
+

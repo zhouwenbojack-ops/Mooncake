@@ -810,6 +810,8 @@ ErrorCode Client::InitTransferEngine(
                 auto_discover = true;
             }
         }
+        // 1. 决定要不要自动发现设备
+        // 自动发现(`auto_discover = true` ) :引擎自己扫描本机所有 RDMA 网卡(HCA),不需要你指定设备名
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
 
@@ -847,6 +849,7 @@ ErrorCode Client::InitTransferEngine(
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
+    // 2. 真正初始化引擎:连上元数据服务、绑定本机地址
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
     if (rc != 0) {
@@ -867,7 +870,7 @@ ErrorCode Client::InitTransferEngine(
         }
         return ErrorCode::OK;
     }
-
+    // 3. 装上具体的传输后端(RDMA/TCP/...)
     if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
@@ -1030,14 +1033,15 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, metadata_connstring, protocol, labels, tenant_id));
-
+    // 连接 Master, 后续所有配置都要从 Master 获取
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         return std::nullopt;
     }
 
     // Initialize storage backend if storage_root_dir is valid
-    auto config_response = client->master_client_.GetStorageConfig();
+    // 存储配置是 Master 下发的,不是 client 本地写死的, 这样运维能在 Master 侧统一控制所有 client 的落盘策略
+    auto config_response = client->master_client_.GetStorageConfig(); // 向 Master 要存储配置,决定要不要落盘
     if (!config_response) {
         LOG(ERROR) << "Failed to get storage config from master";
         // Fallback to GetFsdir for backward compatibility
@@ -1073,7 +1077,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     } else {
         auto config = config_response.value();
-        if (config.fsdir.empty()) {
+        if (config.fsdir.empty()) { // fsdir 为空 -> 不做持久化落盘
             LOG(INFO)
                 << "Storage root directory is not set. persisting data is "
                    "disabled.";
@@ -1107,27 +1111,29 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
+        // 只做元数据 RPC、不搬真实数据(比如只想查询/管理),这时直接返回,跳过最重的 Transfer Engine 初始化
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
         return client;
     }
 
     // Initialize transfer engine
+    // Transfer Engine 可复用 :如果调用方(比如 vLLM 已经有一个 TE 实例)传进来,就不重复创建. 省资源,也避免多个 TE 争抢 RDMA 设备
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names); // 自己创建 transfer_engine
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;
         }
     } else {
-        client->transfer_engine_ = transfer_engine;
+        client->transfer_engine_ = transfer_engine; // 复用外部传入的 transfer_engine
         LOG(INFO) << "Use existing transfer engine instance. Skip its "
                      "initialization.";
     }
 
     client->InitTransferSubmitter();
-    // Initialize local hot cache
+    // Initialize local hot cache, `InitLocalHotCache` 失败只`LOG(ERROR)` ,不 return
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize local hot cache";
@@ -3489,7 +3495,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
     return UnmountSegmentImpl(segment);
 }
-
+// 把一块内存变成"全局可见、可被分配"的存储段
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
@@ -3502,7 +3508,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
-        // Check if the segment overlaps with any existing segment
+        // 防止内存段互相覆盖
         for (auto& it : mounted_segments_) {
             auto& mtseg = it.second;
             uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
@@ -3516,7 +3522,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
-
+        // 向 TransferEngine 注册
         int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
                                                        location, true, true);
         if (rc != 0) {
@@ -3524,20 +3530,21 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                        << " size=" << size << ", error=" << rc;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-
+        // 构造 Segment 元数
         Segment segment;
         segment.id = generate_uuid();
-        segment.name = local_hostname_;
+        segment.name = local_hostname_; // 归属哪个 client
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        // te_endpoint: 记录"要通过哪个传输端点访问这块内存"
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
             segment.te_endpoint = local_hostname_;
         }
-
+        // 把上面构造的 Segment 元数据通过 RPC 上报给 Master。 执行完这一步,Master 就把这块内存纳入全局可分配空间了
         auto mount_result = master_client_.MountSegment(segment);
         if (!mount_result) {
             ErrorCode err = mount_result.error();
@@ -3547,10 +3554,10 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         }
 
         segment_id = segment.id;
-        mounted_segments_[segment_id] = segment;
+        mounted_segments_[segment_id] = segment; // 本地记账, 卸载时要用
     }
 
-    EnsureStorageControlPlaneStarted();
+    EnsureStorageControlPlaneStarted(); // 首次 mount 触发, 启动存储相关的后台线程(心跳等)
     return segment_id;
 }
 

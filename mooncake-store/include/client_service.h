@@ -82,13 +82,13 @@ class Client {
 
     /**
      * @brief Creates and initializes a new Client instance
-     * @param local_hostname Local host address (IP:Port)
-     * @param metadata_connstring Connection string for metadata service
-     * @param protocol Transfer protocol ("rdma" or "tcp")
+     * @param local_hostname 本地地址 (IP:Port), 标识这个client的身份
+     * @param metadata_connstring 元数据服务的连接字符串, Transfer Engine 用来交换 RDMA 元数据
+     * @param protocol 传输协议 ("rdma" or "tcp")
      * @param device_names Comma-separated RDMA device names.
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
-     * @param master_server_entry The entry of master server (IP:Port of master
+     * @param master_server_entry Master 地址 (IP:Port of master
      *        address for non-HA mode, or <backend>://connstring for HA mode,
      *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
      * @return std::optional containing a shared_ptr to Client if successful,

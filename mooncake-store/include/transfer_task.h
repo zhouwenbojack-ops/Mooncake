@@ -225,7 +225,7 @@ class TransferEngineOperationState : public OperationState {
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
-    bool is_completed() override;
+    bool is_completed() override; // 轮询引擎的 batch 状态
 
     void wait_for_completion() override;
 
@@ -256,7 +256,7 @@ class TransferEngineOperationState : public OperationState {
  * operations. Users can check completion status, wait for results, or get the
  * final error code.
  */
-class TransferFuture {
+class TransferFuture { // submit() 统一的异步结果句柄
    public:
     explicit TransferFuture(std::shared_ptr<OperationState> state);
 
@@ -270,19 +270,19 @@ class TransferFuture {
      * @brief Check if the operation has completed (non-blocking)
      * @return true if the operation is finished, false otherwise
      */
-    bool isReady() const;
+    bool isReady() const; // 非阻塞查询
 
     /**
      * @brief Wait for the operation to complete (blocking)
      * @return ErrorCode indicating success or failure
      */
-    ErrorCode wait();
+    ErrorCode wait(); // 阻塞等完成
 
     /**
      * @brief Get the result, waiting if necessary (blocking)
      * @return ErrorCode indicating success or failure
      */
-    ErrorCode get();
+    ErrorCode get(); // 等并取结果
 
     /**
      * @brief Get the transfer strategy used by this operation
@@ -540,7 +540,9 @@ class TransferSubmitter {
                                int numa_socket_id = 0);
 
     /**
-     * @brief Submit an asynchronous transfer operation
+     * @brief Submit an asynchronous transfer operation.
+     * 调用方只管说"我要读/写这个 replica 的这些 slices", 不关心走哪条路. 
+     * selectStrategy() 根据 buffer 描述符和 slices 决定策略,然后分发到对应的`submitXxxOperation`.
      *
      * Analyzes the transfer requirements, selects the optimal strategy,
      * and immediately submits the operation. Returns a TransferFuture
@@ -605,6 +607,8 @@ class TransferSubmitter {
     // the lifetime of the TransferSubmitter, so we avoid calling
     // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
     const std::string local_endpoint_;
+    // 异步执行 workerpool, `memcpy` 和文件读 本身是同步阻塞 的操作, 为了让`submit` 统一表现为"异步返回 Future",
+    // 这些同步操作被丢进各自的 worker 线程池执行,完成后再通过`OperationState` 的cv通知 Future
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
