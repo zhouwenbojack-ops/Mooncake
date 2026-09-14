@@ -170,3 +170,41 @@ submitTransfer(装batch)
         - 让 Master 知道这块内存(登记到全局,这样 Master 分配对象时才能把它算作可用空间)
     - `MountSegment` 就是 同时完成这两件注册 的地方. Master 管"数据该放哪",TransferEngine 管"数据怎么搬"——mount 一块内存,必须两边都登记.
 
+# MasterService
+- 不存数据,只存"元数据" 。它记录"哪个 key 的哪个副本在哪个 Segment 的哪个地址",但数据本身从来不经过 Master——数据由 Client 之间通过 Transfer Engine 直接点对点传.
+- Master 只管理两类状态:
+    1. Segment(内存段) —— 谁贡献了内存池: 每个 Client 把自己的一块内存(DRAM/VRAM)"挂载"给 Master,Master 就获得了在这块内存上分配空间的权力。这些 Segment 汇总起来就是整个集群的 全局内存池.
+    2. 对象元数据(key → 副本) —— 数据在哪: 
+        - 查: GetReplicaList (对应 Client 的`Query` /`Get` ): `GetReplicaList(key)` 拿到副本地址 → Client 直接从那个地址读, `Get` 只有一次 Master RPC
+        - 写(两阶段): PutStart → PutEnd / PutRevoke
+            - Client.Put(key, data):
+                1. PutStart(key, size, config)   → Master 在全局内存池里分配空间, 返回一组 Replica::Descriptor(每个副本的地址)
+                2. Client 拿着地址,用 Transfer Engine 直接把数据写到目标内存 (不经过 Master)
+                3. PutEnd(key)                   → 告诉 Master写完了,把副本标记为可读(COMPLETE), 失败则 PutRevoke 回滚,释放刚分配的空间
+            - Master 只负责"分配和记账",数据搬运交给 Transfer Engine 。这样 Master 不会成为数据带宽瓶颈,它只处理轻量的元数据 RPC
+
+# Replica 与 Client 的关系
+- 副本不属于"发起 Put 的 Client",而属于"数据实际所在的那块内存/磁盘"。关系链是:
+    - Client(贡献内存) ──MountSegment──> Segment(内存段) ──分配──> Replica(副本落在段里)
+    - 发起 Put 的 Client 和副本最终落在哪个 Client 的内存里,可以是两个完全不同的 Client。
+- 从代码看: `Replica` 结构里根本没有 owner client 字段,只有三样东西:
+    - `id_`: 全局唯一 id
+    - `data_`: 副本数据(variant, 5 选 1)
+    - `status_`: 状态机(INITIALIZED → PROCESSING → COMPLETE → REMOVED/FAILED)
+- 5 种副本类型,和 Client 的关系各不相同(`data_` 是 variant):
+    | 副本类型 | 和 Client 的关系 |
+    |----------|------------------|
+    | MEMORY | 通过 buffer 里的 `transport_endpoint` 间接指向"提供内存的 Client",不记 client_id |
+    | NOF_SSD | 同上,落在某 Client 挂载的 SSD 段里 |
+    | DISK | 只有 file_path,是共享/分布式 FS 路径,与具体 Client 无关 |
+    | LOCAL_DISK | 唯一显式带 `client_id` 的类型,因为本地盘只有那个 Client 能读 |
+    | DFS | 分布式文件系统,与具体 Client 无关 |
+    - 大多数副本类型不绑定 Client,只有 LOCAL_DISK 例外(本地盘天然私有,别的节点无法远程访问,必须记住 owner)。
+- 内存副本怎么"间接"关联 Client:
+    - 内存副本的 Descriptor 从 buffer 取出 `AllocatedBuffer::Descriptor`,字段为: `size_` / `buffer_address_` / `protocol_` / `transport_endpoint_`。
+    - 关键是 `transport_endpoint_`: Client 拿到副本描述符后,不需要知道"这是谁的内存",只需 `地址 + 端点`,就能用 Transfer Engine 通过 RDMA 直接读/写。
+    - 副本和 Client 的关系被抽象成"一个可寻址的传输目标",而不是"归属关系"。
+- 那"发起 Put 的 Client"体现在哪?
+    - 体现在 Master 的 API 参数里(PutStart/PutEnd 第一个参数 `const UUID& client_id`),而不是 Replica 结构里。
+    - Master 用它做权限/租约管理、记录"是谁在写"(用于 Client 掉线时清理处理中状态),但不会存进 Replica。
+- 副本用 `地址 + transport_endpoint` 描述自己,让任何 Client 都能远程访问,关系是"可寻址"而非"归属"; 唯一例外是 LOCAL_DISK。

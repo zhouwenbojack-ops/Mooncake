@@ -142,6 +142,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * corresponding quota-table update. The segment mutex is released before
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
  */
+ // 记录"哪个 key 的哪个副本在哪个 Segment 的哪个地址",但数据本身从来不经过 Master——数据由 Client 之间通过 Transfer Engine 直接点对点传
 class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;

@@ -19,6 +19,7 @@ namespace mooncake {
 
 // Forward declaration
 class HttpMetadataServer;
+// 把`MasterService` 的方法 逐个暴露成 coro_rpc 网络接口 ,并在调用前后加上 metrics、限流、HA 检查等横切逻辑
 class WrappedMasterService {
    public:
     // Constructor with optional metadata-cleanup-on-timeout configuration.
