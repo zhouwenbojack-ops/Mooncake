@@ -39,9 +39,9 @@ namespace mooncake {
 namespace {
 
 struct PyTensorInfo {
-    uintptr_t data_ptr;
-    size_t tensor_size;
-    TensorMetadata metadata;
+    uintptr_t data_ptr; // 张量显存/内存的 裸指针
+    size_t tensor_size; // 字节数
+    TensorMetadata metadata; // shape / dtype 等元数据
     py::object owner;
 
     bool valid() const {
@@ -397,6 +397,7 @@ inline int to_py_ret(ErrorCode error_code) {
 
 }  // namespace
 // Python-specific wrapper functions that handle GIL and return pybind11 types
+// torch.Tensor (ptr+shape+dtype) 和 std::vector<Slice> 相互转换
 class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
@@ -1699,6 +1700,7 @@ class MooncakeStorePyWrapper {
     }
 
     // --- End Upsert tensor methods ---
+    // PD 分离 里 prefill 节点"发布"算好的 KVCache,让 decode 节点来订阅取用的语义
     int pub_tensor(const std::string &key, pybind11::object tensor,
                    const ReplicateConfig &config = ReplicateConfig{}) {
         if (!is_client_initialized()) {
@@ -1709,7 +1711,7 @@ class MooncakeStorePyWrapper {
         int validate_result = validate_replicate_config(config);
         if (validate_result) return validate_result;
 
-        return put_tensor_impl(key, tensor, config);
+        return put_tensor_impl(key, tensor, config); // 都走 put 接口, 但是 config 不一样
     }
 
     int pub_tensor_with_tp(const std::string &key, pybind11::object tensor,

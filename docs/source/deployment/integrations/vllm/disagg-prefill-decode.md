@@ -291,9 +291,11 @@ async def handle_request():
     try:
         original_request_data = await request.get_json()
         prefill_request = original_request_data.copy()
+        # 1. 先把请求发给 prefiller,但 max_tokens=1 —— 只算 prefill,不出词
         prefill_request['max_tokens'] = 1  # prefill only
         async for _ in forward_request('http://localhost:8100/v1/completions', prefill_request):
             continue
+        # 2. 再把原始请求发给 decoder —— 它会复用 prefill 产生的 KVCache 继续出词
         generator = forward_request('http://192.168.0.139:8200/v1/completions',  # Change IP
                                     original_request_data)
         response = await make_response(generator)

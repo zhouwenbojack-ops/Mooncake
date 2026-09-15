@@ -208,3 +208,114 @@ submitTransfer(装batch)
     - 体现在 Master 的 API 参数里(PutStart/PutEnd 第一个参数 `const UUID& client_id`),而不是 Replica 结构里。
     - Master 用它做权限/租约管理、记录"是谁在写"(用于 Client 掉线时清理处理中状态),但不会存进 Replica。
 - 副本用 `地址 + transport_endpoint` 描述自己,让任何 Client 都能远程访问,关系是"可寻址"而非"归属"; 唯一例外是 LOCAL_DISK。
+
+# vllm kv Connector
+- vLLM V1 把"KVCache 存到外部/传到别的节点"这件事抽象成了一个插件接口 KVConnectorBase_V1, 这个接口基类把一个 connector 分裂成两个角色:
+    ```py
+    class KVConnectorRole(enum.Enum):
+        # Connector running in the scheduler process
+        SCHEDULER = 0
+
+        # Connector running in the worker process
+        WORKER = 1
+    ```
+    - Scheduler 侧 (跑在调度进程):负责"决策"。它不碰真实的 KVCache 张量,只回答"这个请求有多少 token 能从外部命中"、"请求结束后要不要存":
+        - get_num_new_matched_tokens() —— 命中多少外部缓存 token(决定省掉多少 prefill)
+        - build_connector_meta() —— 把决策打包成"传输计划"发给 worker
+        - request_finished() —— 请求结束,决定是否异步保存
+    - Worker 侧 (跑在每个 GPU worker):负责"搬运"。拿着 scheduler 的计划,真正读写 KVCache 张量:
+        - start_load_kv() —— forward 前异步加载 KV
+        - save_kv_layer() —— 算完一层就异步存这层
+        - wait_for_save() / get_finished() —— 等待/查询异步完成
+
+## MooncakeConnector(P2P)
+- 只依赖 Transfer Engine,不用 Store
+- 角色划分:
+    ```py
+    self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer" # prefill 节点
+    self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer" # decode 节点
+    ```
+- 请求流程:
+    - proxy 收到请求:
+        - 发给 Prefiller (kv_producer), max_tokens=1  只做 prefill;
+            - prefill 算出 KVCache,留在自己显存里. 
+            - request_finished() 返回 True → 不释放 block,等 decode 来拉
+        - 把请求 + prefill 的地址信息 发给 Decoder (kv_consumer):
+            - Decoder scheduler: get_num_new_matched_tokens() → 得知要从 P 拉 KV
+            - Decoder worker: start_load_kv() → 通过 Bootstrap 握手拿到 P 的显存地址 → Transfer Engine 直接 RDMA 从 P 显存拉进 D 显存
+            - 拉完直接开始 decode 出词
+    - 关键机制:
+        - Bootstrap Server: producer 起一个 bootstrap 端口,consumer 通过它握手拿到"KVCache 在 P 的哪块显存"。
+        - 数据路径 :P 显存 →RDMA→ D 显存, 点对点,不落任何中间存储
+        - 特点 :时延最低;但 KVCache 是"一次性"的——P 传给某个 D 后就用完释放了, 不能被复用
+    - Proxy 是一个 独立的 HTTP 转发服务 ,坐在最前面接收用户请求,是 面向业务请求 的调度器。它本身 不属于 Mooncake ,是 vLLM PD 部署里的一个外部脚本
+        ```py
+        # 1. 先把请求发给 prefiller,但 max_tokens=1 —— 只算 prefill,不出词
+        prefill_request['max_tokens'] = 1
+        await forward_request('http://prefiller:8100/...', prefill_request)
+
+        # 2. 再把原始请求发给 decoder —— 它会复用 prefill 产生的 KVCache 继续出词
+        generator = forward_request('http://decoder:8200/...', original_request_data)
+        ```
+    - MooncakeBootstrapServer 是一个 极简的 FastAPI 服务, 让 prefiller 的各个 worker 把自己的连接信息登记进来,供 decoder 查询.
+        - POST /register: prefiller workers 登记自己的`(engine_id, dp/tp/pp_rank, addr)`
+        - GET /query: decoder 拉取所有已登记 worker 的地址表 (`{dp_rank: {tp_rank: {pp_rank: worker_addr}}}`)
+        - 这个服务跑在 prefiller 的 global rank 0 worker 上
+        - Store 版(`MooncakeStoreConnector` )不需要 Bootstrap: 因为两端都只跟 Store 池打交道,靠 key 对接,不需要互相知道对方地址
+    - Decoder 怎么知道 Prefiller 算完了?
+        - Prefiller:
+            - vLLM 的 scheduler 有一个生命周期钩子 request_finished(): 一个请求的 prefill 跑完、要结束时 ,vLLM 会调它。P 端在这里把该请求记进"待发送"清单`reqs_to_send` (带上真实的`block_ids`)
+            - P 端的`request_finished` 返回`True`, 意思是: "我这块 KVCache 显存先别释放,等 D 拉走"
+            - scheduler 的决策通过 metadata 传到 P 端 worker,worker 执行 record_send_reqs():
+                ```py
+                if block_ids:
+                    # 已经走完 request_finished() —— 说明 prefill 真的算完了
+                    send_meta.local_block_ids = block_ids
+                    send_meta.ready.set()          # ← 打开开关:告诉传输侧"数据就绪,可以发了"
+                else:
+                    # 还没到 request_finished(),先建个占位,ready 保持未触发(见 1823-1829)
+                ```
+            - 这行`ready.set()` 就是"prefill 算完了"的物理信号。 在它之前,`ready` 是关着的。
+        - Decoder:
+            - D 端发起传输后,P 端在 wait_and_ret() 里等这个 asyncio.Event 开关:
+                ```py
+                async def wait_and_ret(d_req_id, send_meta):
+                    await send_meta.ready.wait()   # ← 阻塞在这, P 没算完就一直等
+                    return d_req_id, send_meta
+                ```
+            - 只有`ready` 被 set,`wait()` 才返回,后面才会真正 _build_transfer_params → _send_blocks 把数据经 RDMA 送出去
+            - 传输侧用一个状态码回给 D:
+                - `CONTINUE`: 还有请求没就绪,先回一批
+                - `FINISH`: 全部发完
+                - 超时(`VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` ,默认 480s): 等太久,回`FINISH` + 错误,放弃
+            - D 端 worker 收到`FINISH` 后,通过 get_finished() 上报给自己的 scheduler:"这个请求的 KV 收齐了",于是 decode 才真正开始出词
+
+## MooncakeStoreConnector(共享池版)
+- Store 版两端都只跟 Store 打交道 。它们的"暗号"是 基于 prompt 内容 hash 出来的 key
+- 角色划分, 所有 scheduler/worker 方法都只是 转发 给这两个内部对象, 不严格划分 P/D 节点:
+    ```py
+    if role == KVConnectorRole.SCHEDULER:
+        self.connector_scheduler = MooncakeStoreScheduler( # 决策
+            vllm_config, kv_cache_config
+        )
+    else:
+        self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config) # 搬运(读写 Store)
+    ```
+- producer 用某个 key 写进池子,consumer 用 同一个 key 从池子读
+- 请求流程:
+    - 写侧 / prefill 或任意实例, 请求算完 KVCache:
+        - scheduler.request_finished() 判定需要保存
+        - worker: 把 KV 张量 put 进 Store  (pub_tensor → BatchPut)
+        - Store 内部: 问 Master 分配空间 + Transfer Engine 写数据
+    - 读侧 / decode 或后续任意请求:
+        - scheduler.get_num_new_matched_tokens(): 用 key 问 Store "命中吗?" 命中 → 告诉 vLLM 这段 prefill 不用算了
+        - worker: 从 Store get KV 张量,直读进本地显存
+        - 直接进入 decode
+- 比P2P多出来的能力: prefix-cache, 因为 KV 存在共享池、按内容 hash 去重,所以:
+    - 不局限于 1 对 1 的 PD 。任何后续请求(哪怕是同一个实例、不同时间)只要 prompt 前缀相同,都能命中。
+    - PD 分离只是它的一个应用场景,前缀复用才是它的通用价值
+- Decoder 怎么知道 Prefiller 算完了?
+    - D 端是靠`get_num_new_matched_tokens()` 去问 Store "这个 key 在不在",在就说明 P 早已`put` 完成, 不在就当作没命中处理, 对于miss的请求, D自己算完 prefill 后再 put 到 Store 里面
+
+
+
